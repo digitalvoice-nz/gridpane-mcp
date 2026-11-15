@@ -60,6 +60,10 @@ Install the `gridpane` CLI (and `gridpane-mcp`) as tools on your PATH:
 uv tool install git+https://github.com/digitalvoice-nz/gridpane-mcp
 ```
 
+If uv fails with `invalid peer certificate: UnknownIssuer` (common behind antivirus or corporate proxies that inspect HTTPS), add `--system-certs` after `install` so uv uses the Windows certificate store.
+
+Run these from your own PowerShell window, not from a terminal inside the Claude desktop app: Windows redirects that app's writes to `%APPDATA%` into a private folder, so a tool installed from there won't run anywhere else.
+
 Or run the CLI once without installing:
 
 ```powershell
