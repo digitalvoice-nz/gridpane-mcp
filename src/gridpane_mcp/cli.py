@@ -2,7 +2,9 @@
 
 Prints JSON to stdout so pipeline scripts can parse it. Exit codes:
 0 ok, 1 API or input error, 2 bad arguments, 3 timed out waiting,
-4 WP-CLI command blocked by the allowlist, 5 restore cancelled.
+4 WP-CLI command blocked by the allowlist, 5 restore cancelled,
+6 `gridpane ssh`: SSH off or failed, argument rejected, or the remote
+command exited non-zero.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import json
 import sys
 from typing import Any
 
+from . import gridpane_ssh as gpssh
 from .gridpane_client import (
     BACKUP_SOURCES,
     CLEAR_CACHE_SCOPES,
@@ -144,6 +147,121 @@ def cmd_wp(gp: GridPaneClient, a) -> int:
     return 0
 
 
+# ── gridpane ssh ... (GP-CLI backend) ────────────────────────
+
+
+class _LazyApi:
+    """REST client built only if a command needs to look up a host or site."""
+
+    def __init__(self):
+        self._gp: GridPaneClient | None = None
+
+    def __call__(self) -> GridPaneClient:
+        if self._gp is None:
+            self._gp = GridPaneClient.from_env()
+        return self._gp
+
+    def close(self):
+        if self._gp is not None:
+            self._gp.close()
+
+
+def _ssh_target(a, api: _LazyApi, need_site: bool) -> tuple[str, str | None]:
+    site_url = getattr(a, "site_url", None)
+    if a.host:
+        host = a.host
+    elif getattr(a, "site_id", None):
+        host, url = gpssh.site_target(api(), a.site_id)
+        site_url = site_url or url
+    elif getattr(a, "server_id", None):
+        host = gpssh.server_host(api(), a.server_id)
+    else:
+        raise gpssh.GpCliError("Give --site-id, --server-id or --host.")
+    if need_site and not site_url:
+        raise gpssh.GpCliError("This needs a site: give --site-id, or --site-url with --host/--server-id.")
+    return host, site_url
+
+
+def _ssh_out(a, result: gpssh.GpResult) -> int:
+    if a.raw:
+        sys.stdout.write(result.stdout)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+    else:
+        _out(result.to_dict())
+    return 0 if result.exit_code == 0 else 6
+
+
+def cmd_ssh_service(a, api: _LazyApi) -> int:
+    host, _ = _ssh_target(a, api, need_site=False)
+    return _ssh_out(a, gpssh.GpCli.from_env(host).service(a.service, a.action, a.php_version))
+
+
+def cmd_ssh_clear_cache(a, api: _LazyApi) -> int:
+    host, site_url = _ssh_target(a, api, need_site=not a.all_sites)
+    gp = gpssh.GpCli.from_env(host)
+    result = gp.clear_cache(None, all_sites=True) if a.all_sites else gp.clear_cache(site_url)
+    return _ssh_out(a, result)
+
+
+def cmd_ssh_wp(a, api: _LazyApi) -> int:
+    words = list(a.command)
+    allow = a.allow_write
+    if words and words[0] == "--allow-write":
+        allow, words = True, words[1:]
+    if not words:
+        raise gpssh.GpCliError("No WP-CLI command given.")
+    host, site_url = _ssh_target(a, api, need_site=True)
+    # check=False: a failing WP-CLI command still prints its output.
+    return _ssh_out(a, gpssh.GpCli.from_env(host).wp(site_url, " ".join(words), allow_write=allow, check=False))
+
+
+def _add_ssh_parser(sub) -> None:
+    ssh = sub.add_parser(
+        "ssh",
+        help="Run GP-CLI on a server over SSH (needs GRIDPANE_SSH_ENABLE=1 and a root SSH key).",
+        description="Run allowlisted GP-CLI commands on a GridPane server over SSH. "
+        "Off unless GRIDPANE_SSH_ENABLE=1. Uses your OpenSSH client, keys and known_hosts. "
+        "The server is found from --site-id or --server-id through the API, or given with --host.",
+    )
+    ssub = ssh.add_subparsers(dest="ssh_cmd", required=True, metavar="ssh-command")
+
+    def target(sp, site: bool):
+        g = sp.add_argument_group("target")
+        if site:
+            g.add_argument("--site-id", type=int, help="Find the server and site URL through the API.")
+        g.add_argument("--server-id", type=int, help="Find the server's IP through the API.")
+        g.add_argument("--host", help="Server IP or host name; skips the API lookup.")
+        if site:
+            g.add_argument("--site-url", help="Site domain, if not using --site-id.")
+        sp.add_argument("--raw", action="store_true", help="Print the remote output instead of JSON.")
+
+    sp = ssub.add_parser("service", help="Restart, reload, test or check a service.",
+                         description="gp ngx|php|mysql|redis -restart|-reload (nginx also -t, -status).")
+    sp.add_argument("service", choices=gpssh.SERVICES)
+    sp.add_argument("action", choices=("restart", "reload", "test", "status"))
+    sp.add_argument("--php-version", help="Required for php, e.g. 8.2.")
+    target(sp, site=True)
+    sp.set_defaults(fn=cmd_ssh_service)
+
+    sp = ssub.add_parser("clear-cache", help="gp fix cached for one site, or --all-sites on the server.")
+    sp.add_argument("--all-sites", action="store_true", help="Clear every site on the server.")
+    target(sp, site=True)
+    sp.set_defaults(fn=cmd_ssh_clear_cache)
+
+    sp = ssub.add_parser(
+        "wp",
+        help="gp wp: WP-CLI as the site's system user, with its output.",
+        description="Example: gridpane ssh wp --site-id 123 plugin list --status=active. "
+        "Put gridpane's own options before the WP-CLI command.",
+    )
+    sp.add_argument("--allow-write", action="store_true",
+                    help="Allow commands outside the read-only allowlist.")
+    target(sp, site=True)
+    sp.add_argument("command", nargs=argparse.REMAINDER, help="WP-CLI command without the leading 'wp'.")
+    sp.set_defaults(fn=cmd_ssh_wp)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gridpane",
@@ -215,14 +333,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Allow commands outside the read-only allowlist. "
                     "Put it before the WP-CLI command.")
 
+    _add_ssh_parser(sub)
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.cmd == "ssh":
+            api = _LazyApi()
+            try:
+                return args.fn(args, api)
+            finally:
+                api.close()
         with GridPaneClient.from_env() as gp:
             return args.fn(gp, args)
+    except gpssh.GpCliError as e:
+        _err(str(e))
+        if e.body:
+            print(e.body, file=sys.stderr)
+        return 6
     except BackupTimeout as e:
         _err(str(e))
         return 3

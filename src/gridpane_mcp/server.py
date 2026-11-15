@@ -244,6 +244,61 @@ async def run_wp_cli(site_id: int, command: str, allow_write: bool = False) -> s
     return _dump(await _call(lambda: _client().wp(site_id, command, allow_write=allow_write)))
 
 
+# ── GP-CLI over SSH (only registered when GRIDPANE_SSH_ENABLE=1) ──
+
+
+def _register_ssh_tools() -> None:
+    from . import gridpane_ssh as gpssh
+
+    async def _ssh(fn: Callable[[], Any]) -> str:
+        result = await _call(fn)
+        return _dump(result.to_dict())
+
+    @mcp.tool()
+    async def gp_service(
+        server_id: int,
+        service: Literal["nginx", "php", "mysql", "redis"],
+        action: Literal["restart", "reload", "test", "status"],
+        php_version: str | None = None,
+    ) -> str:
+        """Run `gp <service> -<action>` on a server over SSH. php needs
+        php_version (e.g. "8.2"); test and status are nginx only."""
+        return await _ssh(
+            lambda: gpssh.GpCli.from_env(gpssh.server_host(_client(), server_id)).service(
+                service, action, php_version
+            )
+        )
+
+    @mcp.tool()
+    async def gp_clear_cache(site_id: int) -> str:
+        """Run `gp fix cached <site>` on the site's server over SSH."""
+
+        def run():
+            host, url = gpssh.site_target(_client(), site_id)
+            return gpssh.GpCli.from_env(host).clear_cache(url)
+
+        return await _ssh(run)
+
+    @mcp.tool()
+    async def gp_wp(site_id: int, command: str, allow_write: bool = False) -> str:
+        """Run WP-CLI through `gp wp` (as the site's system user) over SSH and
+        return its output. command has no leading "wp", e.g. "plugin list".
+        Same read-only allowlist as run_wp_cli; allow_write also needs
+        GRIDPANE_WP_CLI_ALLOW_WRITE=1 in the server's environment."""
+        if allow_write and os.getenv(WP_CLI_WRITE_ENV) != "1":
+            raise RuntimeError(f"allow_write needs {WP_CLI_WRITE_ENV}=1 in the MCP server's environment.")
+
+        def run():
+            host, url = gpssh.site_target(_client(), site_id)
+            return gpssh.GpCli.from_env(host).wp(url, command, allow_write=allow_write, check=False)
+
+        return await _ssh(run)
+
+
+if os.getenv("GRIDPANE_SSH_ENABLE") == "1":
+    _register_ssh_tools()
+
+
 def main():
     mcp.run(transport="stdio")
 

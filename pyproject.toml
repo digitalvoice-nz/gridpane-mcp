@@ -1,6 +1,6 @@
 [project]
 name = "gridpane-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server and command-line client for the documented GridPane hosting API: sites, caches, tagged backups, restores and WP-CLI."
 readme = "README.md"
 license = "MIT"

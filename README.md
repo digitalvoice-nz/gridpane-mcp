@@ -24,9 +24,9 @@ Upstream's 10 POST tools called endpoints that aren't in GridPane's docs (`site/
 | — | `run_wp_cli` (read-only allowlist) | `PUT site/run-wp-cli/{id}` |
 | `toggle_ssl` | **removed** | none documented. SSL is set per domain: `PUT domain/{domain.id}` (not wrapped yet) |
 | `get_sso_link` | **removed** | none documented |
-| `restart_nginx`, `restart_php`, `restart_mysql` | **removed** | none documented |
+| `restart_nginx`, `restart_php`, `restart_mysql` | `gp_service`, over SSH (see [GP-CLI over SSH](#gp-cli-over-ssh-optional)) | none in the API; GP-CLI `gp ngx\|php\|mysql -restart` |
 
-The removed tools were not kept behind a flag. Nothing public shows those endpoints exist, and a guessed POST that happens to do something unexpected is worse than no tool.
+The removed API calls were not kept behind a flag. Nothing public shows those endpoints exist, and a guessed POST that happens to do something unexpected is worse than no tool. Service restarts come back through the optional SSH backend, which uses GridPane's documented GP-CLI instead.
 
 Unchanged: `list_servers`, `get_server`, `search_server`, `list_sites`, `get_site`, `search_site` (these already matched the docs).
 
@@ -111,6 +111,7 @@ gridpane wp 12345 plugin list --status=active
 | 3 | `--wait` / `wait-backup` timed out |
 | 4 | WP-CLI command blocked by the allowlist |
 | 5 | Restore cancelled at the prompt |
+| 6 | `gridpane ssh`: SSH backend off, SSH failed, argument rejected, or the remote command exited non-zero |
 
 `restore` asks for confirmation when run in a terminal. With stdin redirected (a pipeline) it doesn't ask. `--yes` skips the prompt.
 
@@ -158,6 +159,50 @@ Opting in to anything else:
 
 Per GridPane's docs, the response only says whether the commands ran. It does not return their output, so `plugin list` and the other read commands are mostly useful as a check that WP-CLI runs on the site.
 
+## GP-CLI over SSH (optional)
+
+GridPane's REST API can't restart services, and its WP-CLI endpoint doesn't return output. [GP-CLI](https://gridpane.com/kb/gp-cli-quick-reference/), GridPane's command-line tool on each server, does both. GP-CLI is only reachable over SSH, and GridPane servers accept SSH as **root only**. So this backend gives whatever runs it root on every server it has a key for. It is **off** unless `GRIDPANE_SSH_ENABLE=1`.
+
+Only these commands can be sent. Each is built from validated arguments and quoted for the remote shell; nothing free-form reaches it:
+
+| Command | CLI | MCP tool |
+|---|---|---|
+| `gp ngx -restart` / `-reload` / `-t` / `-status` | `gridpane ssh service nginx restart --server-id 5` | `gp_service` |
+| `gp php 8.2 -restart` / `-reload` | `gridpane ssh service php restart --php-version 8.2 --server-id 5` | `gp_service` |
+| `gp mysql -restart` / `-reload` | `gridpane ssh service mysql restart --server-id 5` | `gp_service` |
+| `gp redis -restart` / `-reload` | `gridpane ssh service redis restart --server-id 5` | `gp_service` |
+| `gp fix cached <site>` | `gridpane ssh clear-cache --site-id 123` | `gp_clear_cache` |
+| `gp fix cached` (every site on the server) | `gridpane ssh clear-cache --server-id 5 --all-sites` | — |
+| `gp wp <site> <command>` | `gridpane ssh wp --site-id 123 plugin list --status=active` | `gp_wp` |
+
+- **Left out on purpose:** `-stop` and `-start`, so a pipeline can't take a service down and leave it down. Backups and restores stay on the REST API, which is the only way to tag a V2 backup and restore it by tag. V1 (legacy) backup commands aren't wrapped.
+- **`gp wp`** runs WP-CLI as the site's system user (plain `wp` as root would leave root-owned files) and returns its output. It uses the same read-only allowlist as `run_wp_cli`, with the same opt-ins: `--allow-write` on the CLI; `allow_write=true` plus `GRIDPANE_WP_CLI_ALLOW_WRITE=1` for MCP.
+- **Finding the server:** `--site-id` and `--server-id` look up the server's IP (and the site's domain) through the REST API, so they need `GRIDPANE_API_TOKEN` too. `--host 203.0.113.10 --site-url example.com` skips the API.
+- **SSH client:** the OpenSSH client built into Windows 10 and later, so your keys, `ssh-agent` and `known_hosts` apply. Host keys are always checked (`StrictHostKeyChecking=yes`) and password prompts are off (`BatchMode=yes`). Connect once by hand to accept each server's host key.
+- **MCP:** the `gp_*` tools are only registered when `GRIDPANE_SSH_ENABLE=1` is set where the MCP server runs.
+
+Setup in PowerShell 5.1. Generate a key for the pipeline, then add the `.pub` file to each server in GridPane (Settings > SSH Keys):
+
+```powershell
+ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\gridpane_pipeline" -C "gridpane-pipeline"
+```
+
+Accept the server's host key once by hand, checking the fingerprint:
+
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\gridpane_pipeline" root@203.0.113.10 exit
+```
+
+Turn the backend on for your user account, then open a new terminal:
+
+```powershell
+[Environment]::SetEnvironmentVariable('GRIDPANE_SSH_ENABLE', '1', 'User'); [Environment]::SetEnvironmentVariable('GRIDPANE_SSH_KEY', "$env:USERPROFILE\.ssh\gridpane_pipeline", 'User')
+```
+
+```powershell
+gridpane ssh service nginx test --server-id 5
+```
+
 ## Not verified against the live API
 
 This was built from the docs alone, without an API token. These points could not be checked:
@@ -169,6 +214,10 @@ This was built from the docs alone, without an API token. These points could not
 - Whether `per_page` on `GET server` / `GET site` does anything (kept from upstream; not in the docs).
 - Whether GridPane passes WP-CLI arguments through a shell (the allowlist assumes it might).
 - Every PUT/POST endpoint above. They match the docs, but none has been called.
+- **SSH backend:** no GP-CLI command has been run on a real server. Syntax is from GridPane's GP-CLI quick reference. Not confirmed:
+  - that the API's site and server objects have `url`, `server_id` and `ip` fields (the server lookup uses them);
+  - that `gp wp` passes arguments containing spaces through intact;
+  - the exit codes GP-CLI returns on failure.
 
 `uv.lock` was already out of step with upstream's `pyproject.toml` and hasn't been regenerated here (uv wasn't available). Run `uv lock` before using `uv sync --locked`; `uvx --from git+...` doesn't use it.
 
@@ -178,7 +227,12 @@ This was built from the docs alone, without an API token. These points could not
 |---|---|---|
 | `GRIDPANE_API_TOKEN` | (required) | GridPane API personal access token |
 | `GRIDPANE_API_URL` | `https://my.gridpane.com/oauth/api/v1` | API base URL |
-| `GRIDPANE_WP_CLI_ALLOW_WRITE` | unset | `1` lets the MCP `run_wp_cli` tool run commands outside the allowlist when the call also sets `allow_write` |
+| `GRIDPANE_WP_CLI_ALLOW_WRITE` | unset | `1` lets the MCP `run_wp_cli` and `gp_wp` tools run commands outside the allowlist when the call also sets `allow_write` |
+| `GRIDPANE_SSH_ENABLE` | unset | `1` turns on the GP-CLI SSH backend (CLI `gridpane ssh`, MCP `gp_*` tools) |
+| `GRIDPANE_SSH_KEY` | ssh default | Private key file for the servers |
+| `GRIDPANE_SSH_USER` | `root` | SSH user (GridPane allows root only) |
+| `GRIDPANE_SSH_PORT` | `22` | SSH port |
+| `GRIDPANE_SSH_KNOWN_HOSTS` | ssh default | A separate known_hosts file, if wanted |
 
 ## License
 
