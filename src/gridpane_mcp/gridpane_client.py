@@ -22,6 +22,7 @@ relying on it in a pipeline.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
@@ -30,6 +31,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 import httpx
+
+logger = logging.getLogger("gridpane")
 
 DEFAULT_API_URL = "https://my.gridpane.com/oauth/api/v1"
 
@@ -188,6 +191,25 @@ def parse_backups(payload: Any) -> list[BackupRef]:
     return sorted(refs, key=lambda r: r.sort_key)
 
 
+def _as_id(value: int | str) -> int | None:
+    """An int, or a string of digits, is an id; anything else is a name."""
+    if isinstance(value, bool):
+        raise GridPaneError("Expected an id or a domain, got a boolean.")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    return int(text) if text.isdigit() else None
+
+
+def normalize_domain(value: str) -> str:
+    """'HTTPS://www.Example.com:443/path' -> 'example.com'."""
+    d = value.strip().lower()
+    d = re.sub(r"^[a-z][a-z0-9+.-]*://", "", d)
+    d = d.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    d = d.rsplit("@", 1)[-1].split(":", 1)[0].rstrip(".")
+    return d[4:] if d.startswith("www.") else d
+
+
 def _check_tag(tag: str) -> str:
     if not _TAG_RE.match(tag):
         raise GridPaneError(
@@ -296,6 +318,50 @@ def wp_cli_from_line(line: str) -> dict[str, list[str]]:
 # ── Client ───────────────────────────────────────────────────
 
 
+def _retry_after(headers: httpx.Headers, attempt: int) -> int:
+    """Seconds to wait after a 429.
+
+    GridPane sends its own headers rather than a standard Retry-After, e.g.
+    `retry-after-endpoint: 23` alongside `x-ratelimit-endpoint-limit: 12` and
+    `x-ratelimit-total-limit: 60`. Uses the longest wait any header asks for,
+    plus a second of slack; falls back to 5, 10, 20... seconds.
+    """
+    waits = []
+    for name in ("retry-after", "retry-after-endpoint", "retry-after-total"):
+        value = headers.get(name)
+        if value and value.strip().isdigit():
+            waits.append(int(value))
+    if not waits:
+        now = time.time()
+        for name in ("x-ratelimit-endpoint-reset", "x-ratelimit-total-reset", "x-ratelimit-reset"):
+            value = headers.get(name)
+            if value and value.strip().isdigit() and int(value) > now:
+                waits.append(int(value) - int(now))
+    wait = max(waits) + 1 if waits else 5 * 2**attempt
+    return max(1, min(wait, 120))
+
+
+def _tls_verify():
+    """TLS trust for API calls: the operating system's certificate store.
+
+    Antivirus HTTPS scanning (e.g. Norton Web/Mail Shield) and corporate
+    proxies re-sign traffic with a root they add to the Windows store, which
+    Python's bundled list doesn't have. GRIDPANE_CA_BUNDLE points at a PEM
+    file instead, if set.
+    """
+    bundle = os.getenv("GRIDPANE_CA_BUNDLE")
+    if bundle:
+        return bundle
+    try:
+        import ssl
+
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        return True
+
+
 class GridPaneClient:
     def __init__(
         self,
@@ -303,14 +369,18 @@ class GridPaneClient:
         base_url: str = DEFAULT_API_URL,
         timeout: float = 60.0,
         transport: httpx.BaseTransport | None = None,
+        rate_limit_retries: int = 5,
     ):
         if not token:
             raise GridPaneError("GRIDPANE_API_TOKEN is not set.")
         self.base_url = base_url.rstrip("/")
+        self.rate_limit_retries = rate_limit_retries
+        self._sites: list[dict] | None = None
         self._http = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
             transport=transport,
+            verify=_tls_verify(),
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
@@ -335,10 +405,23 @@ class GridPaneClient:
         self.close()
 
     def _request(self, method: str, path: str, json: Any = None, params: dict | None = None) -> Any:
-        try:
-            r = self._http.request(method, path, json=json, params=params)
-        except httpx.HTTPError as e:
-            raise GridPaneError(f"{method} {path} failed: {e}") from e
+        attempt = 0
+        while True:
+            try:
+                r = self._http.request(method, path, json=json, params=params)
+            except httpx.HTTPError as e:
+                raise GridPaneError(f"{method} {path} failed: {e}") from e
+            # A 429 is rejected before it is processed, so retrying a POST is safe.
+            if r.status_code == 429 and attempt < self.rate_limit_retries:
+                wait = _retry_after(r.headers, attempt)
+                attempt += 1
+                logger.warning(
+                    "GridPane rate limit on %s %s; waiting %ds (retry %d of %d)",
+                    method, path, wait, attempt, self.rate_limit_retries,
+                )
+                time.sleep(wait)
+                continue
+            break
         try:
             body = r.json() if r.content else {}
         except ValueError:
@@ -348,8 +431,7 @@ class GridPaneClient:
         return body
 
     # Servers and sites (GET) ─────────────────────────────────
-    # `per_page` is not in the docs; it is passed through as before and
-    # should be harmless if ignored.
+    # `per_page` isn't in the docs, but the live API honours it (up to 500).
 
     def list_servers(self, per_page: int = 100) -> Any:
         return self._request("GET", "server", params={"per_page": per_page})
@@ -362,6 +444,79 @@ class GridPaneClient:
 
     def get_site(self, site_id: int) -> Any:
         return self._request("GET", f"site/{site_id}")
+
+    # Domain lookup ───────────────────────────────────────────
+
+    def all_sites(self) -> list[dict]:
+        """Every site, following pagination; cached for this client's life."""
+        if self._sites is None:
+            sites: list[dict] = []
+            page = 1
+            while True:
+                data = self._request("GET", "site", params={"per_page": 500, "page": page})
+                rows = data.get("data", []) if isinstance(data, dict) else data
+                sites.extend(r for r in rows if isinstance(r, dict))
+                meta = data.get("meta", {}) if isinstance(data, dict) else {}
+                if not rows or page >= int(meta.get("last_page") or 1):
+                    break
+                page += 1
+            self._sites = sites
+        return self._sites
+
+    def find_site(self, site: int | str) -> dict:
+        """A site by id or by domain ("example.com", "https://www.example.com/")."""
+        site_id = _as_id(site)
+        if site_id is not None:
+            data = self.get_site(site_id)
+            return data.get("data", data) if isinstance(data, dict) else data
+        want = normalize_domain(str(site))
+        sites = self.all_sites()
+        for s in sites:
+            if normalize_domain(str(s.get("url", ""))) == want:
+                return s
+        # GET site lists only primary sites. GridPane's staging.<domain> and
+        # canary.<domain> copies appear only in each server's `sites` list,
+        # and the API refuses them ("does not belong to the bearer of this
+        # access token"). Return what the server list knows, which is enough
+        # for the SSH backend; REST calls on them will be refused by GridPane.
+        data = self.list_servers()
+        for server in data.get("data", []) if isinstance(data, dict) else data:
+            for s in server.get("sites") or []:
+                if normalize_domain(str(s.get("url", ""))) == want and s.get("id"):
+                    return {
+                        "id": int(s["id"]),
+                        "url": s.get("url"),
+                        "server_id": server.get("id"),
+                        "server": {k: server.get(k) for k in ("id", "label", "ip")},
+                        "api_access": False,
+                        "note": "Staging/canary copy, listed on its server only. GridPane's API "
+                        "refuses calls for it; the `gridpane ssh` commands can reach it.",
+                    }
+        near = [str(s.get("url")) for s in sites if want and want.split(".")[0] in str(s.get("url", ""))]
+        hint = f" Did you mean: {', '.join(near[:5])}?" if near else " `gridpane sites` lists them."
+        raise GridPaneError(f"No site with domain {want!r}.{hint}", 404)
+
+    def find_server(self, server: int | str) -> dict:
+        """A server by id, IP address or label (case-insensitive)."""
+        server_id = _as_id(server)
+        if server_id is not None:
+            data = self.get_server(server_id)
+            return data.get("data", data) if isinstance(data, dict) else data
+        want = str(server).strip().lower()
+        data = self.list_servers()
+        rows = data.get("data", []) if isinstance(data, dict) else data
+        for s in rows:
+            if want in (str(s.get("ip", "")).lower(), str(s.get("label", "")).lower()):
+                return s
+        near = [str(s.get("label")) for s in rows if want in str(s.get("label", "")).lower()]
+        if len(near) == 1:
+            return next(s for s in rows if str(s.get("label")) == near[0])
+        hint = f" Matches: {', '.join(near[:5])}." if near else " `gridpane servers` lists them."
+        raise GridPaneError(f"No single server matching {server!r}.{hint}", 404)
+
+    def resolve_site_id(self, site: int | str) -> int:
+        site_id = _as_id(site)
+        return site_id if site_id is not None else int(self.find_site(site)["id"])
 
     # Site settings: PUT site/{site.id} ───────────────────────
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from typing import Any
 
@@ -43,20 +44,45 @@ def _rows(data: Any) -> list:
 
 
 def cmd_servers(gp: GridPaneClient, a) -> int:
-    _out(gp.list_servers())
+    data = gp.list_servers()
+    if a.full:
+        _out(data)
+        return 0
+    _out([
+        {"id": s.get("id"), "label": s.get("label"), "ip": s.get("ip"),
+         "status": s.get("status"), "sites": len(s.get("sites") or [])}
+        for s in _rows(data)
+    ])
     return 0
 
 
+def _site_summary(s: dict) -> dict:
+    server = s.get("server") if isinstance(s.get("server"), dict) else {}
+    return {
+        "id": s.get("id"),
+        "url": s.get("url"),
+        "server": server.get("label"),
+        "server_id": s.get("server_id"),
+        "server_ip": server.get("ip"),
+        "php_version": s.get("php_version"),
+        "nginx_caching": s.get("nginx_caching"),
+        "is_ssl": s.get("is_ssl"),
+    }
+
+
 def cmd_sites(gp: GridPaneClient, a) -> int:
-    data = gp.list_sites()
+    sites = gp.all_sites()
     if a.search:
-        data = [s for s in _rows(data) if a.search.lower() in str(s.get("url", "")).lower()]
-    _out(data)
+        sites = [s for s in sites if a.search.lower() in str(s.get("url", "")).lower()]
+    sites = sorted(sites, key=lambda s: str(s.get("url", "")))
+    _out(sites if a.full else [_site_summary(s) for s in sites])
     return 0
 
 
 def cmd_site(gp: GridPaneClient, a) -> int:
-    _out(gp.get_site(a.site_id))
+    # By the name given: a staging/canary domain resolves from the server
+    # list, and fetching it by id would be refused.
+    _out(gp.find_site(a.site_ref))
     return 0
 
 
@@ -170,15 +196,15 @@ def _ssh_target(a, api: _LazyApi, need_site: bool) -> tuple[str, str | None]:
     site_url = getattr(a, "site_url", None)
     if a.host:
         host = a.host
-    elif getattr(a, "site_id", None):
-        host, url = gpssh.site_target(api(), a.site_id)
+    elif getattr(a, "site", None):
+        host, url = gpssh.site_target(api(), a.site)
         site_url = site_url or url
-    elif getattr(a, "server_id", None):
-        host = gpssh.server_host(api(), a.server_id)
+    elif getattr(a, "server", None):
+        host = gpssh.server_host(api(), a.server)
     else:
-        raise gpssh.GpCliError("Give --site-id, --server-id or --host.")
+        raise gpssh.GpCliError("Give --site, --server or --host.")
     if need_site and not site_url:
-        raise gpssh.GpCliError("This needs a site: give --site-id, or --site-url with --host/--server-id.")
+        raise gpssh.GpCliError("This needs a site: give --site, or --site-url with --host/--server.")
     return host, site_url
 
 
@@ -222,18 +248,20 @@ def _add_ssh_parser(sub) -> None:
         help="Run GP-CLI on a server over SSH (needs GRIDPANE_SSH_ENABLE=1 and a root SSH key).",
         description="Run allowlisted GP-CLI commands on a GridPane server over SSH. "
         "Off unless GRIDPANE_SSH_ENABLE=1. Uses your OpenSSH client, keys and known_hosts. "
-        "The server is found from --site-id or --server-id through the API, or given with --host.",
+        "The server is found from --site or --server through the API, or given with --host.",
     )
     ssub = ssh.add_subparsers(dest="ssh_cmd", required=True, metavar="ssh-command")
 
     def target(sp, site: bool):
         g = sp.add_argument_group("target")
         if site:
-            g.add_argument("--site-id", type=int, help="Find the server and site URL through the API.")
-        g.add_argument("--server-id", type=int, help="Find the server's IP through the API.")
+            g.add_argument("--site", "--site-id", dest="site", metavar="SITE",
+                           help="Site domain or id; its server is looked up through the API.")
+        g.add_argument("--server", "--server-id", dest="server", metavar="SERVER",
+                       help="Server label, IP or id, looked up through the API.")
         g.add_argument("--host", help="Server IP or host name; skips the API lookup.")
         if site:
-            g.add_argument("--site-url", help="Site domain, if not using --site-id.")
+            g.add_argument("--site-url", help="Site domain to act on with --host or --server.")
         sp.add_argument("--raw", action="store_true", help="Print the remote output instead of JSON.")
 
     sp = ssub.add_parser("service", help="Restart, reload, test or check a service.",
@@ -252,7 +280,7 @@ def _add_ssh_parser(sub) -> None:
     sp = ssub.add_parser(
         "wp",
         help="gp wp: WP-CLI as the site's system user, with its output.",
-        description="Example: gridpane ssh wp --site-id 123 plugin list --status=active. "
+        description="Example: gridpane ssh wp --site example.com plugin list --status=active. "
         "Put gridpane's own options before the WP-CLI command.",
     )
     sp.add_argument("--allow-write", action="store_true",
@@ -272,15 +300,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     def site_cmd(name: str, fn, help: str) -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help, description=help)
-        sp.add_argument("site_id", type=int)
+        sp.add_argument("site_id", metavar="site", help="Site domain (example.com) or id.")
         sp.set_defaults(fn=fn)
         return sp
 
-    sp = sub.add_parser("servers", help="List servers.")
+    sp = sub.add_parser("servers", help="List servers: id, label, IP, site count.")
+    sp.add_argument("--full", action="store_true", help="Print GridPane's whole response.")
     sp.set_defaults(fn=cmd_servers)
 
-    sp = sub.add_parser("sites", help="List sites.")
-    sp.add_argument("--search", help="Only sites whose URL contains this text.")
+    sp = sub.add_parser("sites", help="List sites: id, domain, server, PHP, caching.")
+    sp.add_argument("--search", help="Only sites whose domain contains this text.")
+    sp.add_argument("--full", action="store_true", help="Every field GridPane returns, not the summary.")
     sp.set_defaults(fn=cmd_sites)
 
     site_cmd("site", cmd_site, "Show one site.")
@@ -340,6 +370,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Rate-limit waits and other client warnings go to stderr.
+    logging.basicConfig(level=logging.WARNING, format="gridpane: %(message)s", stream=sys.stderr)
     try:
         if args.cmd == "ssh":
             api = _LazyApi()
@@ -348,6 +380,10 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 api.close()
         with GridPaneClient.from_env() as gp:
+            # Every site command takes a domain or an id; turn it into the id.
+            if getattr(args, "site_id", None) is not None:
+                args.site_ref = args.site_id
+                args.site_id = gp.resolve_site_id(args.site_id)
             return args.fn(gp, args)
     except gpssh.GpCliError as e:
         _err(str(e))

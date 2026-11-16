@@ -19,7 +19,10 @@ from .gridpane_client import GridPaneClient, GridPaneError
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("gridpane-mcp")
 
-mcp = FastMCP("gridpane")
+mcp = FastMCP(
+    "gridpane",
+    instructions="Wherever a tool takes `site`, pass the site's domain (example.com) or its numeric id.",
+)
 
 # Write access through run_wp_cli needs both this env var and allow_write=True,
 # so a model cannot opt itself in.
@@ -41,6 +44,11 @@ async def _call(fn: Callable[[], Any]) -> Any:
         if e.body not in (None, "", {}):
             detail += "\n" + (e.body if isinstance(e.body, str) else json.dumps(e.body, indent=2))
         raise RuntimeError(detail) from e
+
+
+async def _site_id(site: int | str) -> int:
+    """Tools take a site's domain or its id."""
+    return await _call(lambda: _client().resolve_site_id(site))
 
 
 def _dump(data: Any) -> str:
@@ -115,9 +123,9 @@ async def list_sites(per_page: int = 200) -> str:
 
 
 @mcp.tool()
-async def get_site(site_id: int) -> str:
+async def get_site(site: int | str) -> str:
     """Get detailed info for a specific site by its ID."""
-    return _dump(_unwrap(await _call(lambda: _client().get_site(site_id))))
+    return _dump(await _call(lambda: _client().find_site(site)))
 
 
 @mcp.tool()
@@ -134,14 +142,15 @@ async def search_site(domain: str) -> str:
 
 
 @mcp.tool()
-async def clear_site_cache(site_id: int, scope: Literal["page", "object", "all"] = "all") -> str:
+async def clear_site_cache(site: int | str, scope: Literal["page", "object", "all"] = "all") -> str:
     """Clear a site's page cache, object cache, or both."""
+    site_id = await _site_id(site)
     return _dump(await _call(lambda: _client().clear_cache(site_id, scope)))
 
 
 @mcp.tool()
 async def set_nginx_caching(
-    site_id: int,
+    site: int | str,
     mode: Literal["redis", "fastcgi", "none"],
     disable_first: bool = False,
 ) -> str:
@@ -151,19 +160,22 @@ async def set_nginx_caching(
     active type must be set to none first. disable_first=True sends none
     before the new mode.
     """
+    site_id = await _site_id(site)
     return _dump(await _call(lambda: _client().set_nginx_caching(site_id, mode, disable_first)))
 
 
 @mcp.tool()
-async def set_wp_debug(site_id: int, enabled: bool) -> str:
+async def set_wp_debug(site: int | str, enabled: bool) -> str:
     """Turn GridPane's secure WP debug on (true) or off (false) for a site."""
+    site_id = await _site_id(site)
     return _dump(await _call(lambda: _client().set_debug(site_id, enabled)))
 
 
 @mcp.tool()
-async def set_php_version(site_id: int, php_version: str) -> str:
+async def set_php_version(site: int | str, php_version: str) -> str:
     """Change a site's PHP version, e.g. "8.2". GridPane's docs list 7.2-7.4 but
     are out of date; the API decides which versions it accepts."""
+    site_id = await _site_id(site)
     return _dump(await _call(lambda: _client().set_php_version(site_id, php_version)))
 
 
@@ -172,7 +184,7 @@ async def set_php_version(site_id: int, php_version: str) -> str:
 
 @mcp.tool()
 async def create_backup(
-    site_id: int,
+    site: int | str,
     tag: str | None = None,
     type: Literal["local", "remote"] = "local",
     integration_id: int | None = None,
@@ -180,13 +192,15 @@ async def create_backup(
     """Start a manual backup. Optional tag: letters, digits, dashes, max 32,
     not "manual"/"auto". integration_id is required when type is remote.
     The backup runs in the background; use wait_for_backup to know it exists."""
+    site_id = await _site_id(site)
     return _dump(await _call(lambda: _client().create_backup(site_id, type, tag, integration_id)))
 
 
 @mcp.tool()
-async def list_backups(site_id: int, tag: str | None = None, raw: bool = False) -> str:
+async def list_backups(site: int | str, tag: str | None = None, raw: bool = False) -> str:
     """Refresh and list a site's backups. With raw=True, return GridPane's
     response as-is instead of the parsed list."""
+    site_id = await _site_id(site)
     if raw:
         return _dump(await _call(lambda: _client().list_backups(site_id)))
     refs = await _call(lambda: _client().find_backups(site_id, tag))
@@ -195,10 +209,11 @@ async def list_backups(site_id: int, tag: str | None = None, raw: bool = False) 
 
 @mcp.tool()
 async def wait_for_backup(
-    site_id: int, tag: str, timeout_seconds: int = 900, interval_seconds: int = 30
+    site: int | str, tag: str, timeout_seconds: int = 900, interval_seconds: int = 30
 ) -> str:
     """Poll until a backup with this tag shows up in the site's backup list.
     Returns the backup, or an error after timeout_seconds."""
+    site_id = await _site_id(site)
     ref = await _call(
         lambda: _client().wait_for_backup(site_id, tag, timeout_seconds, interval_seconds)
     )
@@ -207,7 +222,7 @@ async def wait_for_backup(
 
 @mcp.tool()
 async def restore_backup(
-    site_id: int,
+    site: int | str,
     backup: str,
     backup_source: Literal["local", "aws-s3", "backblaze", "dropbox", "wasabi"] = "local",
     source_type: Literal["original", "alternative"] = "original",
@@ -215,6 +230,7 @@ async def restore_backup(
 ) -> str:
     """Restore a backup, overwriting the live site. backup is the
     "YYYY-MM-DD HH:MM [tag]" string from list_backups."""
+    site_id = await _site_id(site)
     return _dump(
         await _call(
             lambda: _client().restore_backup(site_id, backup, backup_source, source_type, backup_type)
@@ -223,8 +239,9 @@ async def restore_backup(
 
 
 @mcp.tool()
-async def restore_backup_by_tag(site_id: int, tag: str, backup_source: str | None = None) -> str:
+async def restore_backup_by_tag(site: int | str, tag: str, backup_source: str | None = None) -> str:
     """Restore the newest backup with this tag, overwriting the live site."""
+    site_id = await _site_id(site)
     ref, result = await _call(lambda: _client().restore_by_tag(site_id, tag, backup_source))
     return _dump({"restored": ref.to_dict(), "response": result})
 
@@ -233,12 +250,13 @@ async def restore_backup_by_tag(site_id: int, tag: str, backup_source: str | Non
 
 
 @mcp.tool()
-async def run_wp_cli(site_id: int, command: str, allow_write: bool = False) -> str:
+async def run_wp_cli(site: int | str, command: str, allow_write: bool = False) -> str:
     """Run one WP-CLI command on a site, without the leading "wp", e.g.
     "plugin list --status=active". Only read-only commands (plus cache flush)
     are allowed unless allow_write=True AND the server was started with
     GRIDPANE_WP_CLI_ALLOW_WRITE=1. GridPane returns success/failure only,
     not the command's output."""
+    site_id = await _site_id(site)
     if allow_write and os.getenv(WP_CLI_WRITE_ENV) != "1":
         raise RuntimeError(f"allow_write needs {WP_CLI_WRITE_ENV}=1 in the MCP server's environment.")
     return _dump(await _call(lambda: _client().wp(site_id, command, allow_write=allow_write)))
@@ -256,31 +274,32 @@ def _register_ssh_tools() -> None:
 
     @mcp.tool()
     async def gp_service(
-        server_id: int,
+        server: int | str,
         service: Literal["nginx", "php", "mysql", "redis"],
         action: Literal["restart", "reload", "test", "status"],
         php_version: str | None = None,
     ) -> str:
-        """Run `gp <service> -<action>` on a server over SSH. php needs
-        php_version (e.g. "8.2"); test and status are nginx only."""
+        """Run `gp <service> -<action>` on a server over SSH. server is its
+        label, IP or id. php needs php_version (e.g. "8.2"); test and status
+        are nginx only."""
         return await _ssh(
-            lambda: gpssh.GpCli.from_env(gpssh.server_host(_client(), server_id)).service(
+            lambda: gpssh.GpCli.from_env(gpssh.server_host(_client(), server)).service(
                 service, action, php_version
             )
         )
 
     @mcp.tool()
-    async def gp_clear_cache(site_id: int) -> str:
+    async def gp_clear_cache(site: int | str) -> str:
         """Run `gp fix cached <site>` on the site's server over SSH."""
 
         def run():
-            host, url = gpssh.site_target(_client(), site_id)
+            host, url = gpssh.site_target(_client(), site)
             return gpssh.GpCli.from_env(host).clear_cache(url)
 
         return await _ssh(run)
 
     @mcp.tool()
-    async def gp_wp(site_id: int, command: str, allow_write: bool = False) -> str:
+    async def gp_wp(site: int | str, command: str, allow_write: bool = False) -> str:
         """Run WP-CLI through `gp wp` (as the site's system user) over SSH and
         return its output. command has no leading "wp", e.g. "plugin list".
         Same read-only allowlist as run_wp_cli; allow_write also needs
@@ -289,7 +308,7 @@ def _register_ssh_tools() -> None:
             raise RuntimeError(f"allow_write needs {WP_CLI_WRITE_ENV}=1 in the MCP server's environment.")
 
         def run():
-            host, url = gpssh.site_target(_client(), site_id)
+            host, url = gpssh.site_target(_client(), site)
             return gpssh.GpCli.from_env(host).wp(url, command, allow_write=allow_write, check=False)
 
         return await _ssh(run)

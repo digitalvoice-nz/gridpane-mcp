@@ -64,6 +64,10 @@ If uv fails with `invalid peer certificate: UnknownIssuer` (common behind antivi
 
 Run these from your own PowerShell window, not from a terminal inside the Claude desktop app: Windows redirects that app's writes to `%APPDATA%` into a private folder, so a tool installed from there won't run anywhere else.
 
+The client itself trusts the Windows certificate store too (through `truststore`), so HTTPS scanning by antivirus such as Norton's Web/Mail Shield doesn't break API calls. Set `GRIDPANE_CA_BUNDLE` to a PEM file to use that instead.
+
+**Rate limits.** GridPane allows about 12 requests per window per endpoint group and 60 overall. On HTTP 429 the client waits as long as GridPane's `retry-after-endpoint` header says, then retries, up to 5 times, printing a note to stderr.
+
 Or run the CLI once without installing:
 
 ```powershell
@@ -95,16 +99,20 @@ The server reads `GRIDPANE_API_TOKEN` from your environment, so the token isn't 
 
 Output is JSON on stdout; progress and errors go to stderr.
 
+Every command that takes a site accepts its **domain** (`example.com`; `www.` and `https://` are ignored) or its numeric id. `--server` takes a server's label, IP or id. MCP tools take `site` the same way. `gridpane sites` lists id, domain, server, PHP version and caching for every site (`--search` filters, `--full` gives every field), and `gridpane servers` lists servers.
+
+GridPane's `staging.<domain>` and `canary.<domain>` copies are found too, but the API refuses calls for them ("That site does not belong to the bearer of this access token"). Only the `gridpane ssh` commands can act on them.
+
 ```powershell
 gridpane sites --search example.com
-gridpane clear-cache 12345 --scope all
-gridpane backup 12345 --tag task-42 --wait --timeout 1800
-gridpane backups 12345 --tag task-42
-gridpane restore 12345 --tag task-42
-gridpane debug 12345 off
-gridpane php 12345 8.2
-gridpane nginx-cache 12345 fastcgi --disable-first
-gridpane wp 12345 plugin list --status=active
+gridpane clear-cache example.com --scope all
+gridpane backup example.com --tag task-42 --wait --timeout 1800
+gridpane backups example.com --tag task-42
+gridpane restore example.com --tag task-42
+gridpane debug example.com off
+gridpane php example.com 8.2
+gridpane nginx-cache example.com fastcgi --disable-first
+gridpane wp example.com plugin list --status=active
 ```
 
 | Exit code | Meaning |
@@ -135,6 +143,7 @@ if ($regressionFailed) { gridpane restore $siteId --tag $taskId --yes }
 from gridpane_mcp.gridpane_client import GridPaneClient
 
 with GridPaneClient.from_env() as gp:
+    site_id = gp.resolve_site_id("example.com")  # or the numeric id
     before = gp.find_backups(site_id, tag=task_id)
     gp.create_backup(site_id, tag=task_id)
     gp.wait_for_backup(site_id, task_id, timeout=1800, exclude=before)
@@ -149,7 +158,7 @@ with GridPaneClient.from_env() as gp:
 - **Tags** must be letters, digits and dashes, up to 32 characters. `manual` and `auto` are reserved. A task id like `task-42` fits.
 - **Waiting.** GridPane has no job-status endpoint. `wait_for_backup` calls `backups/refresh` and then `backups/original` every `interval` seconds until a backup with the tag appears. Pass the list taken *before* `create_backup` as `exclude` (the CLI's `backup --wait` does this) so an older backup with the same tag doesn't count.
 - **Restoring by tag** picks the newest backup with that tag. The restore call needs `backup_source` and `backup_type`; they come from the backup list where it says, otherwise `local` and `manual`, which is what `create_backup(type="local", tag=...)` makes.
-- **Parsing the list.** The docs show no example response for `backups/original`. The parser walks the whole response for "YYYY-MM-DD HH:MM [tag]" strings, the format the restore endpoint takes, and for objects with a date field plus a `tag` field. **Run `gridpane backups <site_id> --raw` against a real site once and check it before relying on `--wait` or `restore --tag` in a pipeline.**
+- **Parsing the list.** The docs show no example response for `backups/original`. The parser walks the whole response for "YYYY-MM-DD HH:MM [tag]" strings, the format the restore endpoint takes, and for objects with a date field plus a `tag` field. **Run `gridpane backups <domain> --raw` against a real site once and check it before relying on `--wait` or `restore --tag` in a pipeline.**
 
 ## WP-CLI
 
@@ -157,7 +166,7 @@ with GridPaneClient.from_env() as gp:
 
 Opting in to anything else:
 
-- **CLI:** `gridpane wp 12345 --allow-write plugin update akismet` (put `--allow-write` before the command).
+- **CLI:** `gridpane wp example.com --allow-write plugin update akismet` (put `--allow-write` before the command).
 - **Python:** `gp.wp(site_id, "plugin update akismet", allow_write=True)`.
 - **MCP:** the tool's `allow_write=true` **and** `GRIDPANE_WP_CLI_ALLOW_WRITE=1` in the server's environment. Both are required, so a model can't opt itself in.
 
@@ -171,17 +180,17 @@ Only these commands can be sent. Each is built from validated arguments and quot
 
 | Command | CLI | MCP tool |
 |---|---|---|
-| `gp ngx -restart` / `-reload` / `-t` / `-status` | `gridpane ssh service nginx restart --server-id 5` | `gp_service` |
-| `gp php 8.2 -restart` / `-reload` | `gridpane ssh service php restart --php-version 8.2 --server-id 5` | `gp_service` |
-| `gp mysql -restart` / `-reload` | `gridpane ssh service mysql restart --server-id 5` | `gp_service` |
-| `gp redis -restart` / `-reload` | `gridpane ssh service redis restart --server-id 5` | `gp_service` |
-| `gp fix cached <site>` | `gridpane ssh clear-cache --site-id 123` | `gp_clear_cache` |
-| `gp fix cached` (every site on the server) | `gridpane ssh clear-cache --server-id 5 --all-sites` | — |
-| `gp wp <site> <command>` | `gridpane ssh wp --site-id 123 plugin list --status=active` | `gp_wp` |
+| `gp ngx -restart` / `-reload` / `-t` / `-status` | `gridpane ssh service nginx restart --server sh-akl-02` | `gp_service` |
+| `gp php 8.2 -restart` / `-reload` | `gridpane ssh service php restart --php-version 8.2 --server sh-akl-02` | `gp_service` |
+| `gp mysql -restart` / `-reload` | `gridpane ssh service mysql restart --server sh-akl-02` | `gp_service` |
+| `gp redis -restart` / `-reload` | `gridpane ssh service redis restart --server sh-akl-02` | `gp_service` |
+| `gp fix cached <site>` | `gridpane ssh clear-cache --site example.com` | `gp_clear_cache` |
+| `gp fix cached` (every site on the server) | `gridpane ssh clear-cache --server sh-akl-02 --all-sites` | — |
+| `gp wp <site> <command>` | `gridpane ssh wp --site example.com plugin list --status=active` | `gp_wp` |
 
 - **Left out on purpose:** `-stop` and `-start`, so a pipeline can't take a service down and leave it down. Backups and restores stay on the REST API, which is the only way to tag a V2 backup and restore it by tag. V1 (legacy) backup commands aren't wrapped.
 - **`gp wp`** runs WP-CLI as the site's system user (plain `wp` as root would leave root-owned files) and returns its output. It uses the same read-only allowlist as `run_wp_cli`, with the same opt-ins: `--allow-write` on the CLI; `allow_write=true` plus `GRIDPANE_WP_CLI_ALLOW_WRITE=1` for MCP.
-- **Finding the server:** `--site-id` and `--server-id` look up the server's IP (and the site's domain) through the REST API, so they need `GRIDPANE_API_TOKEN` too. `--host 203.0.113.10 --site-url example.com` skips the API.
+- **Finding the server:** `--site` (domain or id) and `--server` (label, IP or id) look up the server's IP through the REST API, so they need `GRIDPANE_API_TOKEN` too. `--site-id` and `--server-id` still work as aliases. `--host 203.0.113.10 --site-url example.com` skips the API.
 - **SSH client:** the OpenSSH client built into Windows 10 and later, so your keys, `ssh-agent` and `known_hosts` apply. Host keys are always checked (`StrictHostKeyChecking=yes`) and password prompts are off (`BatchMode=yes`). Connect once by hand to accept each server's host key.
 - **MCP:** the `gp_*` tools are only registered when `GRIDPANE_SSH_ENABLE=1` is set where the MCP server runs.
 
@@ -204,22 +213,26 @@ Turn the backend on for your user account, then open a new terminal:
 ```
 
 ```powershell
-gridpane ssh service nginx test --server-id 5
+gridpane ssh service nginx test --server sh-akl-02
 ```
+
+## Checked against the live API
+
+- `GET site` and `GET server`: `url`, `server_id` and a nested `server` (`ip`, `label`) on each site; `per_page` (up to 500) and Laravel-style pagination (`meta.last_page`) work. GET site lists primary sites only.
+- PHP 8.5 is in use on GridPane sites, so the docs' 7.2–7.4 list is out of date.
+- Rate-limit headers: `x-ratelimit-endpoint-limit: 12`, `x-ratelimit-total-limit: 60`, `retry-after-endpoint` in seconds.
 
 ## Not verified against the live API
 
-This was built from the docs alone, without an API token. These points could not be checked:
+These points are still unchecked:
 
 - The response format of `GET backups/original/{id}` (and so the backup parser, `wait_for_backup` and restore-by-tag).
 - Whether `backups/refresh` picks up a new backup as soon as it finishes, and how long a backup takes, so the default 30 s poll and 30 min timeout are guesses.
-- Which PHP versions `php_version` accepts now. The docs list only 7.2–7.4.
+- Which PHP versions `php_version` accepts (8.5 exists; the docs list only 7.2–7.4).
 - Whether `set_nginx_caching(..., disable_first=True)` works in one go, or GridPane needs the `none` change to finish before it accepts the new mode.
-- Whether `per_page` on `GET server` / `GET site` does anything (kept from upstream; not in the docs).
 - Whether GridPane passes WP-CLI arguments through a shell (the allowlist assumes it might).
 - Every PUT/POST endpoint above. They match the docs, but none has been called.
 - **SSH backend:** no GP-CLI command has been run on a real server. Syntax is from GridPane's GP-CLI quick reference. Not confirmed:
-  - that the API's site and server objects have `url`, `server_id` and `ip` fields (the server lookup uses them);
   - that `gp wp` passes arguments containing spaces through intact;
   - the exit codes GP-CLI returns on failure.
 
@@ -231,6 +244,7 @@ This was built from the docs alone, without an API token. These points could not
 |---|---|---|
 | `GRIDPANE_API_TOKEN` | (required) | GridPane API personal access token |
 | `GRIDPANE_API_URL` | `https://my.gridpane.com/oauth/api/v1` | API base URL |
+| `GRIDPANE_CA_BUNDLE` | Windows store | PEM file of trusted certificates for API calls, instead of the OS store |
 | `GRIDPANE_WP_CLI_ALLOW_WRITE` | unset | `1` lets the MCP `run_wp_cli` and `gp_wp` tools run commands outside the allowlist when the call also sets `allow_write` |
 | `GRIDPANE_SSH_ENABLE` | unset | `1` turns on the GP-CLI SSH backend (CLI `gridpane ssh`, MCP `gp_*` tools) |
 | `GRIDPANE_SSH_KEY` | ssh default | Private key file for the servers |

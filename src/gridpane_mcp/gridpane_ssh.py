@@ -220,25 +220,27 @@ class GpCli:
 
 
 # ── Finding the server for a site through the REST API ───────
-# Field names (`url`, `server_id`, `ip`) are the ones upstream already relied
-# on in list output; not confirmed against a live response.
+# Site objects carry `url`, `server_id` and a nested `server` with `ip`
+# (checked against a live GET site response).
 
 
-def _unwrap(data):
-    return data.get("data", data) if isinstance(data, dict) else data
-
-
-def server_host(api: GridPaneClient, server_id: int) -> str:
-    server = _unwrap(api.get_server(server_id))
-    ip = server.get("ip") if isinstance(server, dict) else None
+def server_host(api: GridPaneClient, server: int | str) -> str:
+    """IP of a server given by id, IP or label."""
+    s = api.find_server(server)
+    ip = s.get("ip") if isinstance(s, dict) else None
     if not ip:
-        raise GpCliError(f"Server {server_id} has no `ip` in the API response.")
+        raise GpCliError(f"Server {server!r} has no `ip` in the API response.")
     return str(ip)
 
 
-def site_target(api: GridPaneClient, site_id: int) -> tuple[str, str]:
-    """(server host, site URL) for a site id."""
-    site = _unwrap(api.get_site(site_id))
-    if not isinstance(site, dict) or not site.get("url") or not site.get("server_id"):
-        raise GpCliError(f"Site {site_id}: API response has no `url` / `server_id`.")
-    return server_host(api, int(site["server_id"])), str(site["url"])
+def site_target(api: GridPaneClient, site: int | str) -> tuple[str, str]:
+    """(server IP, site domain) for a site given by id or domain."""
+    s = api.find_site(site)
+    if not isinstance(s, dict) or not s.get("url"):
+        raise GpCliError(f"Site {site!r}: API response has no `url`.")
+    nested = s.get("server") if isinstance(s.get("server"), dict) else {}
+    if nested.get("ip"):
+        return str(nested["ip"]), str(s["url"])
+    if not s.get("server_id"):
+        raise GpCliError(f"Site {site!r}: API response has no `server_id`.")
+    return server_host(api, int(s["server_id"])), str(s["url"])
