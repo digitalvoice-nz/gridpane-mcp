@@ -28,7 +28,7 @@ import re
 import shlex
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import httpx
 
@@ -621,6 +621,7 @@ class GridPaneClient:
         timeout: float = 1800,
         interval: float = 30,
         exclude: Iterable[BackupRef] = (),
+        on_poll: Callable[[float, int], None] | None = None,
     ) -> BackupRef:
         """Poll refresh + original until a backup tagged ``tag`` appears.
 
@@ -628,16 +629,26 @@ class GridPaneClient:
         the backup exists. Pass the result of ``find_backups(site_id, tag)``
         taken before ``create_backup`` as ``exclude`` so an older backup with
         the same tag does not count. Returns the newest new match.
+
+        ``on_poll(elapsed_seconds, backups_listed)`` is called after each
+        check that finds no match, before sleeping.
         """
         _check_tag(tag)
         skip = {r.backup for r in exclude}
-        deadline = time.monotonic() + timeout
+        start = time.monotonic()
+        deadline = start + timeout
         while True:
-            matches = [r for r in self.find_backups(site_id, tag) if r.backup not in skip]
+            refs = self.find_backups(site_id)
+            matches = [
+                r for r in refs
+                if r.tag and r.tag.lower() == tag.lower() and r.backup not in skip
+            ]
             if matches:
                 return matches[-1]
             if time.monotonic() + interval > deadline:
                 raise BackupTimeout(f"No backup tagged {tag!r} on site {site_id} after {timeout:.0f}s.")
+            if on_poll:
+                on_poll(time.monotonic() - start, len(refs))
             time.sleep(interval)
 
     def restore_backup(

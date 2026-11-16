@@ -115,8 +115,10 @@ def cmd_backup(gp: GridPaneClient, a) -> int:
     if not a.wait:
         _out(result)
         return 0
-    _err(f"backup requested; waiting up to {a.timeout}s for tag {a.tag!r}...")
-    ref = gp.wait_for_backup(a.site_id, a.tag, a.timeout, a.interval, exclude=before)
+    _err(f"backup requested; waiting up to {_mmss(a.timeout)} for tag {a.tag!r}...")
+    ref = gp.wait_for_backup(
+        a.site_id, a.tag, a.timeout, a.interval, exclude=before, on_poll=_wait_progress(a)
+    )
     _out({"requested": result, "backup": ref.to_dict()})
     return 0
 
@@ -130,8 +132,27 @@ def cmd_backups(gp: GridPaneClient, a) -> int:
 
 
 def cmd_wait_backup(gp: GridPaneClient, a) -> int:
-    _out(gp.wait_for_backup(a.site_id, a.tag, a.timeout, a.interval).to_dict())
+    _err(f"waiting up to {_mmss(a.timeout)} for tag {a.tag!r}...")
+    ref = gp.wait_for_backup(a.site_id, a.tag, a.timeout, a.interval, on_poll=_wait_progress(a))
+    _out(ref.to_dict())
     return 0
+
+
+def _mmss(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _wait_progress(a):
+    """Print one stderr line per check, so a long wait doesn't look stalled."""
+
+    def report(elapsed: float, listed: int) -> None:
+        _err(
+            f"[{_mmss(elapsed)} / {_mmss(a.timeout)}] no {a.tag!r} backup yet "
+            f"({listed} backups listed); checking again in {a.interval}s"
+        )
+
+    return report
 
 
 def _confirm(prompt: str) -> bool:
