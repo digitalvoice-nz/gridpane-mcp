@@ -256,9 +256,9 @@ async def run_wp_cli(site: int | str, command: str, allow_write: bool = False) -
     are allowed unless allow_write=True AND the server was started with
     GRIDPANE_WP_CLI_ALLOW_WRITE=1. GridPane returns success/failure only,
     not the command's output."""
-    site_id = await _site_id(site)
     if allow_write and os.getenv(WP_CLI_WRITE_ENV) != "1":
         raise RuntimeError(f"allow_write needs {WP_CLI_WRITE_ENV}=1 in the MCP server's environment.")
+    site_id = await _site_id(site)
     return _dump(await _call(lambda: _client().wp(site_id, command, allow_write=allow_write)))
 
 
