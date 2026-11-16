@@ -221,18 +221,19 @@ gridpane ssh service nginx test --server sh-akl-02
 - `GET site` and `GET server`: `url`, `server_id` and a nested `server` (`ip`, `label`) on each site; `per_page` (up to 500) and Laravel-style pagination (`meta.last_page`) work. GET site lists primary sites only.
 - PHP 8.5 is in use on GridPane sites, so the docs' 7.2–7.4 list is out of date.
 - `GET backups/refresh` + `GET backups/original`: response format above, read correctly for local and Wasabi automatic backups.
+- `POST backups` with a tag: the backup appears under `local.manual` as `YYYY-MM-DD HH:MM tag`. On one small site it was listed about a minute after the request.
 - Rate-limit headers: `x-ratelimit-endpoint-limit: 12`, `x-ratelimit-total-limit: 60`, `retry-after-endpoint` in seconds.
 
 ## Not verified against the live API
 
 These points are still unchecked:
 
-- How a **tagged manual** backup appears in that list. The site checked had only automatic backups, so the `manual` key and the tag's position are taken from the restore endpoint's documented format.
-- Whether `backups/refresh` picks up a new backup as soon as it finishes, and how long a backup takes, so the default 30 s poll and 30 min timeout are guesses.
+- How long backups of larger sites take, so the default 30 s poll and 30 min timeout are still guesses.
+- Restore (`POST backups/restore`), by date string or by tag.
 - Which PHP versions `php_version` accepts (8.5 exists; the docs list only 7.2–7.4).
 - Whether `set_nginx_caching(..., disable_first=True)` works in one go, or GridPane needs the `none` change to finish before it accepts the new mode.
 - Whether GridPane passes WP-CLI arguments through a shell (the allowlist assumes it might).
-- Every PUT/POST endpoint above. They match the docs, but none has been called.
+- Every PUT/POST endpoint above except `POST backups`. They match the docs, but none has been called.
 - **SSH backend:** no GP-CLI command has been run on a real server. Syntax is from GridPane's GP-CLI quick reference. Not confirmed:
   - that `gp wp` passes arguments containing spaces through intact;
   - the exit codes GP-CLI returns on failure.
