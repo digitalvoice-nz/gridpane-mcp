@@ -129,11 +129,18 @@ def _infer_type(token: Any) -> str | None:
 def parse_backups(payload: Any) -> list[BackupRef]:
     """Pull every backup out of a backups/original response.
 
-    The response format is not documented, so this walks the whole JSON
-    tree. Any string shaped like "YYYY-MM-DD HH:MM [tag]" counts as a
-    backup, as does an object holding a date-time field plus a ``tag``
-    field. The backup source and type come from the keys and values found
-    on the way down (e.g. ``{"local": {"manual": [...]}}``).
+    The live API (checked 2026-11) returns one comma-separated string per
+    storage and type::
+
+        {"success": true, "message": "Available backups", "url": "example.com",
+         "backups": {"local":  {"automatic": "2026-11-05 02:00,2026-11-12 02:00"},
+                     "wasabi": {"automatic": "...", "manual": "2026-11-16 09:30 task-42"}}}
+
+    The docs don't describe this, so the parser stays general: it walks the
+    whole JSON tree, and any string (or comma-separated part of one) shaped
+    like "YYYY-MM-DD HH:MM [tag]" counts as a backup, as does an object
+    with a date-time field plus a ``tag`` field. Source and type come from
+    the keys and values on the way down.
     """
     found: dict[tuple, BackupRef] = {}
 
@@ -145,9 +152,11 @@ def parse_backups(payload: Any) -> list[BackupRef]:
 
     def walk(node: Any, src: str | None, typ: str | None):
         if isinstance(node, str):
-            m = _BACKUP_STR_RE.match(node)
-            if m:
-                add(m.group(1), m.group(2), m.group(3), m.group(4), src, typ)
+            # Tags are letters, digits and dashes, so a comma always separates.
+            for part in node.split(","):
+                m = _BACKUP_STR_RE.match(part)
+                if m:
+                    add(m.group(1), m.group(2), m.group(3), m.group(4), src, typ)
             return
         if isinstance(node, list):
             for item in node:
@@ -656,14 +665,20 @@ class GridPaneClient:
         )
 
     def resolve_tag(self, site_id: int, tag: str, backup_source: str | None = None) -> BackupRef:
-        """Newest backup with this tag, optionally limited to one source."""
+        """Newest backup with this tag, optionally limited to one source.
+
+        If the newest one exists in several places (local and remote copies
+        of the same backup), the local copy wins: it's already on the server.
+        """
         _check_tag(tag)
         refs = self.find_backups(site_id, tag)
         if backup_source:
             refs = [r for r in refs if r.backup_source in (backup_source, None)]
         if not refs:
             raise GridPaneError(f"No backup tagged {tag!r} found for site {site_id}.", 404)
-        return refs[-1]
+        newest = refs[-1].sort_key
+        same_time = [r for r in refs if r.sort_key == newest]
+        return next((r for r in same_time if r.backup_source in ("local", None)), same_time[-1])
 
     def restore_by_tag(
         self,

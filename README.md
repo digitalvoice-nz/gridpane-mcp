@@ -158,7 +158,7 @@ with GridPaneClient.from_env() as gp:
 - **Tags** must be letters, digits and dashes, up to 32 characters. `manual` and `auto` are reserved. A task id like `task-42` fits.
 - **Waiting.** GridPane has no job-status endpoint. `wait_for_backup` calls `backups/refresh` and then `backups/original` every `interval` seconds until a backup with the tag appears. Pass the list taken *before* `create_backup` as `exclude` (the CLI's `backup --wait` does this) so an older backup with the same tag doesn't count.
 - **Restoring by tag** picks the newest backup with that tag. The restore call needs `backup_source` and `backup_type`; they come from the backup list where it says, otherwise `local` and `manual`, which is what `create_backup(type="local", tag=...)` makes.
-- **Parsing the list.** The docs show no example response for `backups/original`. The parser walks the whole response for "YYYY-MM-DD HH:MM [tag]" strings, the format the restore endpoint takes, and for objects with a date field plus a `tag` field. **Run `gridpane backups <domain> --raw` against a real site once and check it before relying on `--wait` or `restore --tag` in a pipeline.**
+- **Parsing the list.** `backups/original` returns one comma-separated string per storage and type, e.g. `{"backups": {"local": {"automatic": "2026-11-05 02:00,2026-11-12 02:00"}, "wasabi": {...}}}`. Each entry is the "YYYY-MM-DD HH:MM [tag]" string the restore endpoint takes. The parser splits these and reads the storage and type from the keys. When the newest tagged backup exists both locally and remotely, restore-by-tag uses the local copy.
 
 ## WP-CLI
 
@@ -220,13 +220,14 @@ gridpane ssh service nginx test --server sh-akl-02
 
 - `GET site` and `GET server`: `url`, `server_id` and a nested `server` (`ip`, `label`) on each site; `per_page` (up to 500) and Laravel-style pagination (`meta.last_page`) work. GET site lists primary sites only.
 - PHP 8.5 is in use on GridPane sites, so the docs' 7.2–7.4 list is out of date.
+- `GET backups/refresh` + `GET backups/original`: response format above, read correctly for local and Wasabi automatic backups.
 - Rate-limit headers: `x-ratelimit-endpoint-limit: 12`, `x-ratelimit-total-limit: 60`, `retry-after-endpoint` in seconds.
 
 ## Not verified against the live API
 
 These points are still unchecked:
 
-- The response format of `GET backups/original/{id}` (and so the backup parser, `wait_for_backup` and restore-by-tag).
+- How a **tagged manual** backup appears in that list. The site checked had only automatic backups, so the `manual` key and the tag's position are taken from the restore endpoint's documented format.
 - Whether `backups/refresh` picks up a new backup as soon as it finishes, and how long a backup takes, so the default 30 s poll and 30 min timeout are guesses.
 - Which PHP versions `php_version` accepts (8.5 exists; the docs list only 7.2–7.4).
 - Whether `set_nginx_caching(..., disable_first=True)` works in one go, or GridPane needs the `none` change to finish before it accepts the new mode.
